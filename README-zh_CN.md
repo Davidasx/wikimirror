@@ -1,6 +1,7 @@
 # wikimirror
 [简体中文](README-zh_CN.md)   [English](README.md)
-使用CloudFlare轻松搭建维基百科镜像。
+
+使用CloudFlare Workers轻松搭建维基百科镜像。
 
 ## 简单搭建
 创建两个CF Workers并分别贴入`image.js`和`main.js`。然后，分配自己的域名。
