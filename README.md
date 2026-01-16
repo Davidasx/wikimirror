@@ -4,11 +4,11 @@
 Build a Wikipedia mirror with CloudFlare Workers.
 
 ## How to Build
-Create **two** CloudFlare Workers. Put `image.js` into one and `main.js` into the other. Then, assign them with your own domain names.
+Create a CloudFlare Worker. Paste the contents of `main.js` into the editor and replace all occurrences of `wiki.davidx.top` with your assigned domain name. Click deploy and add a route for your domain name if it's not the default `workers.dev` domain.
 
-Replace `wiki-img.davidx.top` with the domain name that you assigned for `image.js` and `wiki.davidx.top` for `main.js`.
+Visit the domain name to use.
 
-Visit the domain name assigned for `main.js` to use.
+Note that multilingual versions are now accessed via URL paths instead of subdomains. For example, use `https://YOUR-DOMAIN-NAME/en` for English Wikipedia and `https://YOUR-DOMAIN-NAME/zh` for Chinese Wikipedia.
 
 ## Known Issues
 - Doesn't support login/editing. (IP is banned and login has problems).
