@@ -28,8 +28,9 @@ Multilingual versions are accessed via URL paths instead of subdomains, e.g. `ht
 - **Streaming HTML rewriting** via `HTMLRewriter` instead of running hundreds of `replaceAll` passes over a multi-megabyte document.
 - **A client-side patch** is inlined at the very top of `<head>` so it runs before the `async` startup module. It maps URLs created at runtime: dynamic `<script>`/`<link>` (which is exactly how `mw.loader` fetches modules), `fetch`, `XMLHttpRequest`, `sendBeacon`, `EventSource`, `WebSocket`, and URL-bearing attribute writes.
 - **CSP is augmented, not deleted.** Upstream's third-party allowlist is preserved; the mirror's own origin and Cloudflare's analytics beacon are added, and the Wikimedia reporting endpoints are stripped.
+- **Reader preferences survive, tracking cookies don't.** Only `mf_useformat`, `stopMobileRedirect` and `mwclientpreferences` are passed between browser and upstream — enough for the mobile/desktop toggle and for dark mode / font size. Wikimedia's tracking cookies (`WMF-Uniq`, `GeoIP`, …) are dropped so upstream can't fingerprint visitors through the mirror. Since mobile and desktop are the same URL with different HTML, the preference is folded into the edge cache key; visitors with no preference cookie still share one cache entry.
 
 ## Known Issues
-- Doesn't support login/editing (Cloudflare IPs are blocked upstream, and sessions aren't proxied).
+- Doesn't support login/editing (Cloudflare IPs are blocked upstream, and session cookies aren't proxied).
 - Gadgets that load from third-party CDNs still reach those CDNs directly; only Wikimedia-family domains are proxied.
 - `data-mw-original-href` attributes and COinS citation metadata deliberately keep the original upstream hostnames, since rewriting them would corrupt archive links and bibliographic records.

@@ -28,8 +28,9 @@
 - **HTML 用`HTMLRewriter`流式改写**，不再对几 MB 的正文做几百遍`replaceAll`（这是旧版 Error 1102 CPU 超时的根因）。
 - **客户端补丁内联在`<head>`最前面**，保证跑在 async 的 startup 模块之前。它负责映射运行时才产生的地址：动态`<script>`/`<link>`（`mw.loader`正是这样加载模块的）、`fetch`、`XMLHttpRequest`、`sendBeacon`、`EventSource`、`WebSocket`，以及各种带 URL 的属性写入。
 - **CSP 是增补而非删除。** 保留上游的第三方白名单，补上镜像自身来源与 Cloudflare 统计脚本，并去掉指向维基媒体的上报端点。
+- **保留读者偏好，丢弃追踪 Cookie。** 只在浏览器与上游之间放行`mf_useformat`、`stopMobileRedirect`、`mwclientpreferences`——足够让「移动版视图」切换、夜间模式和字号生效。维基媒体的追踪 Cookie（`WMF-Uniq`、`GeoIP`等）一律丢掉，免得上游隔着镜像给访客打指纹。由于移动版与桌面版是同一个 URL 的两份不同 HTML，偏好会并入边缘缓存键；没有偏好 Cookie 的访客仍共用同一份缓存。
 
 ## 已知问题
-- 暂不支持登陆与编辑（CF 的 IP 已被上游封禁，且不代理会话）。
+- 暂不支持登陆与编辑（CF 的 IP 已被上游封禁，且不代理会话 Cookie）。
 - 从第三方 CDN 加载的小工具仍会直连该 CDN；只有维基媒体家族域名会走代理。
 - `data-mw-original-href`属性与 COinS 引文元数据会**故意**保留原始上游主机名，因为改写它们会破坏存档链接和书目记录。

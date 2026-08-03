@@ -72,6 +72,20 @@ const TEXTUAL =
 /** 超过这个大小的文本响应直接透传，避免无谓的 CPU 消耗。 */
 const MAX_REWRITE_BYTES = 12 * 1024 * 1024;
 
+/**
+ * 只在浏览器与上游之间放行这几个 Cookie —— 全是匿名读者的显示偏好：
+ *   mf_useformat        移动版 / 桌面版视图（点「移动版视图」就是靠它生效）
+ *   stopMobileRedirect  抑制自动跳转到移动版
+ *   mwclientpreferences 夜间模式、字号、限制宽度
+ * 其余一律丢弃：WMF-Uniq / GeoIP / WMF-Last-Access 这些追踪 Cookie 会让上游
+ * 隔着镜像给访客打指纹，会话 Cookie 又用不上（不支持登录），留着只会打碎缓存。
+ */
+const COOKIE_ALLOWLIST = new Set([
+    "mf_useformat",
+    "stopMobileRedirect",
+    "mwclientpreferences",
+]);
+
 // ===========================================================================
 // 语言判定
 // ===========================================================================
@@ -801,6 +815,54 @@ function rewriteLinkHeader(headers, ctx) {
     );
 }
 
+// ===========================================================================
+// Cookie：只放行读者的显示偏好
+// ===========================================================================
+
+/** 取出请求里被放行的 Cookie，排序后形如 ["mf_useformat=true"]。 */
+function allowedCookiePairs(request) {
+    const raw = request.headers.get("cookie");
+    if (!raw) return [];
+    return raw
+        .split(";")
+        .map((c) => c.trim())
+        .filter((c) => c && COOKIE_ALLOWLIST.has(c.split("=")[0].trim()))
+        .sort();
+}
+
+/**
+ * 缓存键要带上偏好变体：移动版和桌面版是同一个 URL 的两份不同 HTML，
+ * 不区分的话桌面访客会拿到别人缓存的移动版页面（反之亦然）。
+ * 没有偏好 Cookie 的访客（绝大多数）仍然共用同一份缓存，不会造成碎片。
+ */
+function cacheKeyFor(url, request) {
+    const pairs = allowedCookiePairs(request);
+    if (!pairs.length) return new Request(url.toString(), { method: "GET" });
+    const keyUrl = new URL(url.toString());
+    keyUrl.searchParams.set("__wm_pref", pairs.join("&"));
+    return new Request(keyUrl.toString(), { method: "GET" });
+}
+
+/** 逐条拆分 Set-Cookie。Expires 里含逗号，所以不能简单按逗号切。 */
+function splitSetCookie(upstream) {
+    if (typeof upstream.headers.getAll === "function") {
+        return upstream.headers.getAll("set-cookie");
+    }
+    const raw = upstream.headers.get("set-cookie");
+    if (!raw) return [];
+    return raw.split(/,\s*(?=[A-Za-z0-9!#$%&'*+._`|~-]+=)/);
+}
+
+/** 只回传被放行的 Set-Cookie，并去掉 Domain= 让它只作用于镜像自身。 */
+function filterSetCookie(upstream, headers) {
+    headers.delete("set-cookie");
+    for (const cookie of splitSetCookie(upstream)) {
+        const name = cookie.split("=")[0].trim();
+        if (!COOKIE_ALLOWLIST.has(name)) continue;
+        headers.append("set-cookie", cookie.replace(/;\s*Domain=[^;]*/i, ""));
+    }
+}
+
 function baseHeaders(upstream, ctx) {
     const h = new Headers(upstream.headers);
 
@@ -809,10 +871,11 @@ function baseHeaders(upstream, ctx) {
     h.delete("content-length");
     h.delete("transfer-encoding");
 
-    // 不支持登录，会话 Cookie 只会污染缓存
-    h.delete("set-cookie");
+    // 只留读者的显示偏好，丢掉追踪与会话 Cookie
+    filterSetCookie(upstream, h);
 
-    // 上游按 Cookie / UA 分片，对镜像无意义
+    // 偏好差异已并进缓存键，这里不要写 Vary: Cookie —— 否则任何无关 Cookie
+    // （例如 __cf_bm）都会各自占一份缓存，命中率直接崩掉。
     h.set("Vary", "Accept-Encoding");
 
     augmentCSP(h);
@@ -854,6 +917,12 @@ function forwardHeaders(request) {
     }
     // 上游按 Referer 做防盗链；给一个上游自身的地址最稳
     out.set("Referer", `https://${CFG.DEFAULT_LANG}.wikipedia.org/`);
+
+    // 转发读者的显示偏好，否则「移动版视图」永远切不过去：
+    // 该功能全靠 mf_useformat Cookie，上游收不到就一直给桌面版。
+    const cookies = allowedCookiePairs(request);
+    if (cookies.length) out.set("Cookie", cookies.join("; "));
+
     return out;
 }
 
@@ -909,11 +978,17 @@ async function proxy(request, route, mirrorOrigin, cacheable, waitUntil) {
         out = new Response(resp.body, { status: resp.status, headers });
     }
 
-    if (cacheable && out.status === 200 && waitUntil) {
-        const key = new Request(request.url, { method: "GET" });
+    // 带 Set-Cookie 的响应不能进缓存（Cache API 会直接拒绝），
+    // 而且那是「刚刚切换了偏好」的一次性响应，本来也不该被别人复用。
+    if (
+        cacheable &&
+        out.status === 200 &&
+        !out.headers.has("set-cookie") &&
+        waitUntil
+    ) {
         waitUntil(
             caches.default
-                .put(key, out.clone())
+                .put(cacheKeyFor(url, request), out.clone())
                 .catch(() => {}) // 缓存失败不影响响应
         );
     }
@@ -1023,9 +1098,7 @@ async function handleRequest(request, waitUntil) {
 
     if (cacheable) {
         try {
-            const hit = await caches.default.match(
-                new Request(url.toString(), { method: "GET" })
-            );
+            const hit = await caches.default.match(cacheKeyFor(url, request));
             if (hit) return hit;
         } catch (e) {
             /* 缓存不可用就直接回源 */
