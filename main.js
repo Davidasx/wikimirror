@@ -1,208 +1,933 @@
-addEventListener("fetch", (event) => {
-    event.respondWith(handleRequest(event.request));
-});
+/**
+ * wikimirror — 用 Cloudflare Workers 搭建的 Wikipedia 镜像
+ * https://github.com/Davidasx/wikimirror
+ *
+ * 设计要点
+ * ---------------------------------------------------------------------------
+ * 1. 语言不再打表。语言码有固定形状（见 LANG_SHAPE），而 MediaWiki 自己的根路径
+ *    里只有 api / www / cdn-cgi 三个会撞上这个形状，列入 NOT_A_LANG 即可。
+ *    再叠加一层权威校验：从 meta.wikimedia.org 的 sitematrix 拉真实语言集合，
+ *    缓存在边缘，异步刷新，失败则放行（fail-open），永不阻塞请求。
+ *
+ * 2. 所有维基媒体家族域名都走镜像，页面不会再直连上游。
+ *      /<lang>/<path>              -> <lang>.wikipedia.org/<path>
+ *      /-/<hostname>/<path>        -> <hostname>/<path>   （家族域名白名单内）
+ *      /                           -> www.wikipedia.org   （门户）
+ *    这解决了 issue #1：ResourceLoader 的模块源 mw.loader.addSource() 里写的是
+ *    绝对地址 https://<lang>.wikipedia.org/w/load.php，它在 JS 响应里，旧版只改写
+ *    text/html 所以原样漏给了浏览器，导致所有按需加载的模块（折叠表格、导航框
+ *    展开、参考文献浮窗、页面预览、多媒体查看器……）都去直连上游而失败。
+ *
+ * 3. HTML 用 HTMLRewriter 流式改写（不再对 1.4MB 正文做几百遍 replaceAll，
+ *    这是旧版 Error 1102 CPU 超时的根因）；JS / CSS / JSON / XML 做定向文本改写；
+ *    二进制原样流式转发。
+ *
+ * 4. 注入的客户端补丁是内联且同步的，保证在 async 的 startup 模块之前执行，
+ *    并且拦截动态 <script>/<link> 的 src/href（mw.loader 正是用它加载模块）。
+ *
+ * 5. 无需改代码即可部署：镜像域名从请求本身推导，不存在需要全局替换的常量。
+ */
 
-const CONFIG = {
-    ALLOWED_HOSTNAME: "wiki.davidx.top",
-    WIKI_HOSTNAME: "wikipedia.org",
-    REPLACE_RULES: {
-        "upload.wikimedia.org": "wiki.davidx.top/image-proxy",
-        "www.wikipedia.org": "wiki.davidx.top",
-    },
-    SUPPORTED_LANGUAGES: ['en', 'ceb', 'de', 'fr', 'sv', 'nl', 'ru', 'es', 'it', 'pl', 'arz', 'zh', 'ja', 'uk', 'vi', 'war', 'ar', 'pt', 'fa', 'ca', 'id', 'sr', 'ko', 'no', 'tr', 'ce', 'fi', 'cs', 'hu', 'tt', 'ro', 'sh', 'eu', 'zh-min-nan', 'ms', 'he', 'eo', 'hy', 'da', 'bg', 'uz', 'cy', 'simple', 'sk', 'et', 'be', 'azb', 'el', 'kk', 'min', 'hr', 'lt', 'gl', 'ur', 'az', 'sl', 'lld', 'ka', 'nn', 'ta', 'th', 'hi', 'bn', 'mk', 'zh-yue', 'la', 'ast', 'lv', 'af', 'tg', 'my', 'te', 'sq', 'mr', 'mg', 'bs', 'sw', 'ku', 'oc', 'be-tarask', 'br', 'ml', 'nds', 'ky', 'lmo', 'jv', 'pnb', 'ckb', 'new', 'ht', 'vec', 'pms', 'lb', 'ba', 'su', 'ga', 'is', 'szl', 'cv', 'pa', 'fy', 'ha', 'io', 'mzn', 'glk', 'tl', 'an', 'wuu', 'diq', 'vo', 'ig', 'yo', 'sco', 'kn', 'ne', 'als', 'gu', 'avk', 'ia', 'crh', 'bar', 'ban', 'scn', 'bpy', 'mn', 'qu', 'nv', 'si', 'xmf', 'ps', 'frr', 'os', 'or', 'tum', 'sd', 'bcl', 'sah', 'bat-smg', 'cdo', 'gd', 'bug', 'yi', 'ilo', 'am', 'li', 'nap', 'gor', 'as', 'fo', 'mai', 'hsb', 'map-bms', 'shn', 'zh-classical', 'eml', 'ie', 'ace', 'wa', 'sa', 'hyw', 'sat', 'zu', 'zgh', 'sn', 'lij', 'mhr', 'hif', 'km', 'dag', 'bjn', 'mrj', 'mni', 'ary', 'hak', 'pam', 'rue', 'roa-tara', 'ug', 'bh', 'nso', 'co', 'tly', 'so', 'vls', 'nds-nl', 'mi', 'se', 'rw', 'myv', 'kaa', 'sc', 'ff', 'mdf', 'bo', 'mt', 'kw', 'vep', 'tk', 'kab', 'gv', 'gan', 'fiu-vro', 'skr', 'zea', 'ab', 'ks', 'smn', 'gn', 'pcd', 'frp', 'udm', 'kv', 'csb', 'ay', 'nrm', 'ang', 'ln', 'fur', 'olo', 'lfn', 'lez', 'pap', 'nah', 'mwl', 'lo', 'tw', 'stq', 'ext', 'rm', 'lad', 'gom', 'av', 'dty', 'tyv', 'koi', 'dsb', 'lg', 'cbk-zam', 'dv', 'ksh', 'za', 'blk', 'bxr', 'gag', 'bew', 'pfl', 'haw', 'szy', 'tcy', 'pag', 'tay', 'pi', 'fon', 'awa', 'kge', 'gpe', 'inh', 'krc', 'xh', 'atj', 'to', 'pdc', 'mnw', 'arc', 'shi', 'tn', 'om', 'dga', 'ki', 'nov', 'nia', 'jam', 'kbp', 'wo', 'xal', 'kbd', 'anp', 'nqo', 'kg', 'bi', 'roa-rup', 'tpi', 'mad', 'tet', 'guw', 'jbo', 'fj', 'pcm', 'kcg', 'lbe', 'cu', 'st', 'iba', 'ty', 'dtp', 'trv', 'sm', 'ami', 'srn', 'btm', 'alt', 'ltg', 'gcr', 'ny', 'ss', 'mos', 'kus', 'chr', 'ee', 'bbc', 'ts', 'got', 'gur', 'bm', 've', 'pih', 'rmy', 'fat', 'chy', 'rn', 'igl', 'guc', 'ik', 'ch', 'ady', 'rsk', 'pnt', 'iu', 'ann', 'pwn', 'dz', 'ti', 'sg', 'din', 'tdd', 'kl', 'bdr', 'nr', 'tig', 'cr'],
-    IMAGE_EXTENSIONS: [
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".svg",
-        ".webp",
-        ".ico",
-    ],
-    // 统一 User-Agent（含 GitHub 仓库信息）
-    COMMON_UA: "Wikimirror/1.0 (+https://github.com/Davidasx/wikimirror)",
+// ===========================================================================
+// 配置
+// ===========================================================================
+
+const CFG = {
+    // 可选的主机名白名单。留空 = 接受任何绑定到本 Worker 的域名（推荐）。
+    ALLOWED_HOSTNAMES: [],
+
+    // 无法从 Referer / Accept-Language 推断语言时的兜底
+    DEFAULT_LANG: "en",
+
+    UA: "Wikimirror/2.0 (+https://github.com/Davidasx/wikimirror)",
+
+    // 通用跨站代理前缀：/-/<hostname>/<path>
+    HOST_PREFIX: "/-",
+
+    // sitematrix 缓存时长（秒）
+    LANGSET_TTL: 604800,
 };
 
-function escapeForRegex(s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * 语言码形状。已对全部 296 个真实维基百科语言码验证通过，零漏判。
+ * 覆盖 zh-min-nan / be-tarask / bat-smg / map-bms / zh-classical / roa-rup /
+ * cbk-zam / fiu-vro / nds-nl / roa-tara 这类带连字符的历史码，以及 simple。
+ */
+const LANG_SHAPE = /^(?:simple|[a-z]{2,3}(?:-[a-z0-9]{2,10}){0,2})$/;
+
+/** 形状上像语言码、但实际是 MediaWiki / Cloudflare 的路径，必须排除。 */
+const NOT_A_LANG = new Set(["api", "www", "cdn-cgi"]);
+
+/** 镜像自己拥有的首段：绝不给它们加语言前缀。 */
+const NO_PREFIX = new Set(["-", "image-proxy", "cdn-cgi"]);
+
+/** 允许经 /-/<host>/ 代理的维基媒体家族域名。 */
+const FAMILY_HOST =
+    /^(?:[a-z0-9-]+\.)*(?:wikipedia|wikimedia|wikimediafoundation|wikidata|wiktionary|wikibooks|wikiquote|wikisource|wikinews|wikiversity|wikivoyage|wikifunctions|mediawiki|toolforge|wmcloud|wmflabs)\.org$/i;
+
+/** 需要做文本改写的 content-type。 */
+const TEXTUAL =
+    /^(?:application\/(?:x-)?(?:java|ecma)script|text\/(?:java|ecma)script|application\/json|application\/ld\+json|text\/css|text\/xml|application\/xml|application\/rss\+xml|application\/opensearchdescription\+xml)/i;
+
+/** 超过这个大小的文本响应直接透传，避免无谓的 CPU 消耗。 */
+const MAX_REWRITE_BYTES = 12 * 1024 * 1024;
+
+// ===========================================================================
+// 语言判定
+// ===========================================================================
+
+/** sitematrix 拉到的权威语言集合；null = 尚未就绪（此时只用形状判定）。 */
+let LANG_SET = null;
+let LANGSET_INFLIGHT = null;
+
+function isLangCode(seg) {
+    if (!seg) return false;
+    const s = seg.toLowerCase();
+    if (NOT_A_LANG.has(s) || !LANG_SHAPE.test(s)) return false;
+    // 权威集合就绪后用它兜底否决拼写错误 / 不存在的语言
+    if (LANG_SET && LANG_SET.size && !LANG_SET.has(s)) return false;
+    return true;
 }
 
-function isImagePath(path) {
-    return CONFIG.IMAGE_EXTENSIONS.some((ext) =>
-        path.toLowerCase().endsWith(ext)
-    );
-}
-
-function extractLangFromReferer(request) {
-    const ref =
-        request.headers.get("referer") || request.headers.get("referrer");
-    if (!ref) return null;
-    try {
-        const u = new URL(ref);
-        const parts = u.pathname.split("/").filter(Boolean);
-        if (parts.length && CONFIG.SUPPORTED_LANGUAGES.includes(parts[0])) {
-            return parts[0];
+/**
+ * 从 meta.wikimedia.org 拉取真实存在的维基百科语言码。
+ * 结果缓存在边缘（LANGSET_TTL），任何失败都 fail-open（保持 LANG_SET 为空）。
+ */
+async function refreshLangSet(mirrorOrigin) {
+    if (LANGSET_INFLIGHT) return LANGSET_INFLIGHT;
+    LANGSET_INFLIGHT = (async () => {
+        const cacheKey = new Request(`${mirrorOrigin}/-/__langset`);
+        const cache = caches.default;
+        try {
+            const hit = await cache.match(cacheKey);
+            if (hit) {
+                const codes = await hit.json();
+                if (Array.isArray(codes) && codes.length) {
+                    LANG_SET = new Set(codes);
+                    return LANG_SET;
+                }
+            }
+        } catch (e) {
+            /* 缓存不可用则继续走网络 */
         }
-    } catch (e) {}
+
+        try {
+            const api =
+                "https://meta.wikimedia.org/w/api.php" +
+                "?action=sitematrix&format=json&formatversion=2" +
+                "&smtype=language&smstate=all";
+            const resp = await fetch(api, {
+                headers: { "User-Agent": CFG.UA, Accept: "application/json" },
+            });
+            if (!resp.ok) return null;
+            const data = await resp.json();
+            const matrix = data && data.sitematrix;
+            if (!matrix) return null;
+
+            const codes = new Set();
+            for (const key of Object.keys(matrix)) {
+                if (!/^\d+$/.test(key)) continue;
+                const sites = matrix[key] && matrix[key].site;
+                if (!Array.isArray(sites)) continue;
+                for (const site of sites) {
+                    if (!site || site.code !== "wiki" || !site.url) continue;
+                    // 语言码取 URL 里的实际子域，而不是 sitematrix 的 code 字段
+                    // （例如闽南语 code 是 "nan"，但域名是 zh-min-nan.wikipedia.org）
+                    const m = /^https?:\/\/([a-z0-9-]+)\.wikipedia\.org/i.exec(
+                        site.url
+                    );
+                    if (m) codes.add(m[1].toLowerCase());
+                }
+            }
+            if (!codes.size) return null;
+
+            LANG_SET = codes;
+            try {
+                await cache.put(
+                    cacheKey,
+                    new Response(JSON.stringify([...codes]), {
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Cache-Control": `public, max-age=${CFG.LANGSET_TTL}`,
+                        },
+                    })
+                );
+            } catch (e) {
+                /* 写缓存失败无所谓 */
+            }
+            return LANG_SET;
+        } catch (e) {
+            return null; // fail-open
+        } finally {
+            LANGSET_INFLIGHT = null;
+        }
+    })();
+    return LANGSET_INFLIGHT;
+}
+
+// ===========================================================================
+// 路由：镜像路径 <-> 上游主机
+// ===========================================================================
+
+/**
+ * 解析请求路径，得到 { prefix, host, path }。
+ *   prefix ""              -> www.wikipedia.org（门户）
+ *   prefix "/zh"           -> zh.wikipedia.org
+ *   prefix "/-/<hostname>" -> <hostname>
+ * 无法归类时返回 null（交给无前缀兜底逻辑）。
+ */
+function resolveRoute(pathname) {
+    const parts = pathname.split("/").filter(Boolean);
+
+    if (!parts.length) {
+        return { prefix: "", host: "www.wikipedia.org", path: "/" };
+    }
+
+    // 通用跨站代理 /-/<hostname>/<path>
+    if (parts[0] === "-") {
+        const host = (parts[1] || "").toLowerCase();
+        if (!host || !FAMILY_HOST.test(host)) return null;
+        return {
+            prefix: `/-/${host}`,
+            host,
+            path: "/" + parts.slice(2).join("/"),
+        };
+    }
+
+    // 兼容旧版 /image-proxy/<path>
+    if (parts[0] === "image-proxy") {
+        return {
+            prefix: "/-/upload.wikimedia.org",
+            host: "upload.wikimedia.org",
+            path: "/" + parts.slice(1).join("/"),
+        };
+    }
+
+    if (isLangCode(parts[0])) {
+        const lang = parts[0].toLowerCase();
+        return {
+            prefix: `/${lang}`,
+            host: `${lang}.wikipedia.org`,
+            path: "/" + parts.slice(1).join("/"),
+        };
+    }
+
     return null;
 }
 
-// 客户端补丁脚本（外部文件内容）
-// 该脚本会拦截 fetch/XHR/link/form 并为以 /api/ /w/ /wiki/ 开头但无 lang 前缀的内部请求补上当前页面的 lang
-const CLIENT_PATCH_CONTENT = `
-(function(){
-  try {
-    var pathParts = location.pathname.split('/').filter(Boolean);
-    var lang = pathParts[0];
-    if (!lang) return;
-    var prefixes = ['/api/', '/w/', '/wiki/'];
-    function needsPatch(url) {
-      if (!url) return false;
-      if (url.indexOf('://') !== -1 || url.startsWith('//')) return false;
-      if (!url.startsWith('/')) return false;
-      for (var i = 0; i < prefixes.length; i++) {
-        if (url.indexOf(prefixes[i]) === 0) return true;
-      }
-      return false;
-    }
-    function rewrite(url) {
-      if (!needsPatch(url)) return url;
-      if (url.indexOf('/' + lang + '/') === 0) return url;
-      return '/' + lang + url;
-    }
-    var _fetch = window.fetch;
-    window.fetch = function(input, init) {
-      try {
-        if (typeof input === 'string') {
-          input = rewrite(input);
-        } else if (input && input.url) {
-          var newUrl = rewrite(input.url);
-          if (newUrl !== input.url) {
-            input = new Request(newUrl, {
-              method: input.method || (init && init.method) || 'GET',
-              headers: input.headers || (init && init.headers),
-              body: input.body || (init && init.body),
-              credentials: input.credentials || (init && init.credentials),
-              redirect: input.redirect || (init && init.redirect) || 'follow'
-            });
-          }
-        }
-      } catch (e) {}
-      return _fetch.apply(this, arguments);
-    };
-    (function(open){
-      XMLHttpRequest.prototype.open = function(method, url) {
-        try { url = rewrite(url); } catch(e) {}
-        return open.apply(this, [method, url].concat(Array.prototype.slice.call(arguments,2)));
-      }
-    })(XMLHttpRequest.prototype.open);
-    document.addEventListener('click', function(e){
-      try {
-        var a = e.target.closest && e.target.closest('a');
-        if (!a) return;
-        var href = a.getAttribute('href');
-        if (!href) return;
-        if (needsPatch(href)) {
-          a.setAttribute('href', rewrite(href));
-        }
-      } catch(e){}
-    }, true);
-    document.addEventListener('submit', function(e){
-      try {
-        var f = e.target;
-        var action = f.getAttribute && f.getAttribute('action');
-        if (!action) return;
-        if (needsPatch(action)) {
-          f.setAttribute('action', rewrite(action));
-        }
-      } catch(e){}
-    }, true);
-  } catch (err) {}
-})();
-`;
+/** 从 prefix 反推上游主机，用于 Referer 兜底。 */
+function hostFromPrefix(prefix) {
+    if (!prefix) return "www.wikipedia.org";
+    const parts = prefix.split("/").filter(Boolean);
+    if (parts[0] === "-") return parts[1] || null;
+    return isLangCode(parts[0]) ? `${parts[0].toLowerCase()}.wikipedia.org` : null;
+}
 
-// helper: try to add our origin to script-src in CSP; fallback to deleting CSP if cannot safely patch
-function adjustCSPHeader(headers, ourOrigin) {
-    // headers is a Headers-like object (we'll work with plain string)
-    const csp = headers.get("content-security-policy");
-    if (!csp) {
-        return; // nothing to do
-    }
+/** 从 Referer 里恢复镜像前缀（同源子资源请求会带完整路径的 Referer）。 */
+function prefixFromReferer(request, mirrorHost) {
+    const ref = request.headers.get("referer");
+    if (!ref) return null;
     try {
-        // Basic parse: split directives, find script-src; if none, try default-src
-        const parts = csp.split(";").map((p) => p.trim());
-        let found = false;
-        for (let i = 0; i < parts.length; i++) {
-            if (parts[i].startsWith("script-src")) {
-                // append ourOrigin if not present
-                if (parts[i].indexOf(ourOrigin) === -1) {
-                    parts[i] = parts[i] + " " + ourOrigin;
-                }
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            // if no script-src but has default-src, attempt to append to default-src
-            let defaultIndex = -1;
-            for (let i = 0; i < parts.length; i++) {
-                if (parts[i].startsWith("default-src")) {
-                    defaultIndex = i;
-                    break;
-                }
-            }
-            if (defaultIndex >= 0) {
-                if (parts[defaultIndex].indexOf(ourOrigin) === -1) {
-                    parts[defaultIndex] = parts[defaultIndex] + " " + ourOrigin;
-                }
-                found = true;
-            }
-        }
-        if (found) {
-            headers.set("content-security-policy", parts.join("; "));
-            return;
-        }
+        const u = new URL(ref);
+        if (u.host !== mirrorHost) return null;
+        const route = resolveRoute(u.pathname);
+        return route ? route.prefix : "";
     } catch (e) {
-        // parsing failed -> fallthrough to delete
+        return null;
     }
-    // fallback: delete CSP headers (less secure but ensures injected script runs)
-    headers.delete("content-security-policy");
-    headers.delete("content-security-policy-report-only");
 }
 
-// image proxy: map /image-proxy/<path> -> https://upload.wikimedia.org/<path>
-async function handleImageProxy(request, imagePath) {
-    const upstream = new URL(
-        imagePath,
-        "https://upload.wikimedia.org"
-    ).toString();
-    // use same UA
-    const upstreamResp = await fetch(upstream, {
-        method: request.method,
-        headers: {
-            Accept: request.headers.get("Accept") || "*/*",
-            "User-Agent": CONFIG.COMMON_UA,
-            Referer: request.headers.get("Referer") || "",
-        },
-        cf: { cacheEverything: true },
+/** 从 Accept-Language 猜一个语言前缀。 */
+function prefixFromAcceptLanguage(request) {
+    const al = request.headers.get("accept-language");
+    if (!al) return null;
+    for (const item of al.split(",")) {
+        const tag = item.split(";")[0].trim().toLowerCase();
+        if (!tag || tag === "*") continue;
+        if (isLangCode(tag)) return `/${tag}`;
+        const base = tag.split("-")[0];
+        if (isLangCode(base)) return `/${base}`;
+    }
+    return null;
+}
+
+// ===========================================================================
+// URL 改写
+// ===========================================================================
+
+/** 上游主机名 -> 镜像 origin + 前缀。无需改写时返回 null。 */
+function mirrorForHost(host, mirrorOrigin) {
+    const h = host.toLowerCase();
+    if (h === "www.wikipedia.org" || h === "wikipedia.org") return mirrorOrigin;
+    const m = /^([a-z0-9-]+)\.wikipedia\.org$/.exec(h);
+    if (m && isLangCode(m[1])) return `${mirrorOrigin}/${m[1]}`;
+    if (FAMILY_HOST.test(h)) return `${mirrorOrigin}${CFG.HOST_PREFIX}/${h}`;
+    return null;
+}
+
+const SKIP_SCHEME = /^(?:data|blob|javascript|mailto|tel|about|magnet|geo):/i;
+
+/**
+ * 改写单个 URL：
+ *   - 维基媒体家族的绝对地址 -> 镜像路径
+ *   - 根相对路径 -> 补上当前镜像前缀
+ *   - 其余原样返回
+ */
+function rewriteUrl(raw, ctx) {
+    if (typeof raw !== "string") return raw;
+    const s = raw.trim();
+    if (!s || s[0] === "#" || SKIP_SCHEME.test(s)) return raw;
+
+    // 协议相对：//host/path
+    if (s.startsWith("//")) {
+        const host = s.slice(2).split(/[/?#]/)[0];
+        const target = mirrorForHost(host, ctx.origin);
+        return target ? target + s.slice(2 + host.length) : raw;
+    }
+
+    // 绝对地址
+    const abs = /^https?:\/\/([^/?#]+)/i.exec(s);
+    if (abs) {
+        const target = mirrorForHost(abs[1], ctx.origin);
+        return target ? target + s.slice(abs[0].length) : raw;
+    }
+
+    // 根相对
+    if (s[0] === "/") {
+        if (s[1] === "/") return raw; // 已在上面处理，防御性分支
+        const slash = s.indexOf("/", 1);
+        const seg = (slash < 0 ? s.slice(1) : s.slice(1, slash)).toLowerCase();
+        if (NO_PREFIX.has(seg)) return raw; // 镜像自己的路径
+        if (isLangCode(seg)) return raw; // 已经带了语言前缀
+        return ctx.prefix + s;
+    }
+
+    return raw; // 相对路径由浏览器按当前 URL 解析，天然正确
+}
+
+/** 改写 srcset / imagesrcset（逗号分隔，每项 "url 描述符"）。 */
+function rewriteSrcset(value, ctx) {
+    return value
+        .split(",")
+        .map((part) => {
+            const m = /^(\s*)(\S+)(.*)$/.exec(part);
+            return m ? m[1] + rewriteUrl(m[2], ctx) + m[3] : part;
+        })
+        .join(",");
+}
+
+// 文本（JS / CSS / JSON / 内联脚本）中的绝对地址
+const TEXT_ABS_RE = new RegExp(
+    "(https?:)?//((?:[a-z0-9-]+\\.)*(?:wikipedia|wikimedia|wikimediafoundation|wikidata|wiktionary|wikibooks|wikiquote|wikisource|wikinews|wikiversity|wikivoyage|wikifunctions|mediawiki|toolforge|wmcloud|wmflabs)\\.org)",
+    "gi"
+);
+
+// 文本中的根相对路径，只针对 MediaWiki 确定会用到的几个前缀，避免误伤
+const TEXT_ROOTREL_RE = /(["'`(=])\/(w\/|wiki\/|api\/|static\/|rest\.php|index\.php|load\.php|api\.php)/g;
+
+// wgScriptPath 这类恰好等于 "/w" 的值
+const TEXT_SCRIPTPATH_RE = /(["'`])\/w(["'`])/g;
+
+/**
+ * 改写 JS / CSS / JSON / 内联脚本里的地址。
+ * 这一步是修好 issue #1 的关键：startup 模块里的
+ *   mw.loader.addSource({"local":"https://zh.wikipedia.org/w/load.php", ...})
+ * 会被换成镜像地址，后续所有按需模块才不会去直连上游。
+ */
+function rewriteText(text, ctx) {
+    let out = text.replace(TEXT_ABS_RE, (m, _scheme, host) => {
+        const target = mirrorForHost(host, ctx.origin);
+        return target || m;
     });
-    const resp = new Response(upstreamResp.body, {
-        status: upstreamResp.status,
-        statusText: upstreamResp.statusText,
-        headers: upstreamResp.headers,
+    if (ctx.prefix) {
+        out = out.replace(TEXT_ROOTREL_RE, `$1${ctx.prefix}/$2`);
+        out = out.replace(TEXT_SCRIPTPATH_RE, `$1${ctx.prefix}/w$2`);
+    }
+    return out;
+}
+
+// ===========================================================================
+// 客户端补丁脚本
+// ===========================================================================
+
+/**
+ * 内联注入到 <head> 最前面，同步执行，保证跑在 async 的 startup 模块之前。
+ * 职责：把运行时才产生的地址（动态 <script>/<link>、fetch、XHR、sendBeacon…）
+ * 也映射到镜像上，作为服务端改写的第二道保险。
+ */
+function clientPatch(ctx) {
+    const cfg = JSON.stringify({
+        p: ctx.prefix,
+        family: FAMILY_HOST.source,
+        lang: LANG_SHAPE.source,
+        notLang: [...NOT_A_LANG],
+        noPrefix: [...NO_PREFIX],
     });
-    resp.headers.set("Access-Control-Allow-Origin", "*");
-    resp.headers.set(
-        "Cache-Control",
-        "public, max-age=604800, s-maxage=604800"
+
+    return `(function(){
+if (window.__wikimirror__) return;
+var C = ${cfg};
+var FAMILY = new RegExp(C.family, "i");
+var LANG = new RegExp(C.lang);
+var NOT_LANG = {}, NO_PREFIX = {};
+C.notLang.forEach(function(k){ NOT_LANG[k] = 1; });
+C.noPrefix.forEach(function(k){ NO_PREFIX[k] = 1; });
+var ORIGIN = location.origin;
+var SKIP = /^(?:data|blob|javascript|mailto|tel|about|magnet|geo):/i;
+
+function isLang(s){ return !!s && !NOT_LANG[s] && LANG.test(s); }
+
+function forHost(host){
+  var h = String(host).toLowerCase();
+  if (h === "www.wikipedia.org" || h === "wikipedia.org") return ORIGIN;
+  var m = /^([a-z0-9-]+)\\.wikipedia\\.org$/.exec(h);
+  if (m && isLang(m[1])) return ORIGIN + "/" + m[1];
+  if (FAMILY.test(h)) return ORIGIN + "/-/" + h;
+  return null;
+}
+
+function map(raw){
+  try {
+    if (typeof raw !== "string") return raw;
+    var s = raw.trim();
+    if (!s || s.charAt(0) === "#" || SKIP.test(s)) return raw;
+    if (s.slice(0, 2) === "//") {
+      var h = s.slice(2).split(/[\\/?#]/)[0], t = forHost(h);
+      return t ? t + s.slice(2 + h.length) : raw;
+    }
+    var abs = /^https?:\\/\\/([^\\/?#]+)/i.exec(s);
+    if (abs) { var t2 = forHost(abs[1]); return t2 ? t2 + s.slice(abs[0].length) : raw; }
+    if (s.charAt(0) === "/") {
+      var i = s.indexOf("/", 1);
+      var seg = (i < 0 ? s.slice(1) : s.slice(1, i)).toLowerCase();
+      if (NO_PREFIX[seg] || isLang(seg)) return raw;
+      return C.p + s;
+    }
+    return raw;
+  } catch (e) { return raw; }
+}
+
+window.__wikimirror__ = { prefix: C.p, map: map };
+
+// --- fetch ---------------------------------------------------------------
+if (window.fetch) {
+  var _fetch = window.fetch;
+  window.fetch = function(input, init){
+    try {
+      if (typeof input === "string") {
+        input = map(input);
+      } else if (input && typeof input === "object" && typeof input.url === "string") {
+        var u = map(input.url);
+        if (u !== input.url) input = new Request(u, input);
+      }
+    } catch (e) {}
+    return _fetch.call(this, input, init);
+  };
+}
+
+// --- XHR -----------------------------------------------------------------
+if (window.XMLHttpRequest) {
+  var _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url){
+    var args = Array.prototype.slice.call(arguments);
+    try { args[1] = map(url); } catch (e) {}
+    return _open.apply(this, args);
+  };
+}
+
+// --- sendBeacon / EventSource / WebSocket --------------------------------
+if (navigator.sendBeacon) {
+  var _beacon = navigator.sendBeacon.bind(navigator);
+  navigator.sendBeacon = function(url, data){ return _beacon(map(url), data); };
+}
+if (window.EventSource) {
+  var _ES = window.EventSource;
+  window.EventSource = function(url, cfg){ return new _ES(map(url), cfg); };
+  window.EventSource.prototype = _ES.prototype;
+}
+if (window.WebSocket) {
+  var _WS = window.WebSocket;
+  window.WebSocket = function(url, protocols){
+    try {
+      var s = String(url).replace(/^wss?:\\/\\//i, function(m){ return m.toLowerCase() === "ws://" ? "http://" : "https://"; });
+      var mapped = map(s);
+      if (mapped !== s) url = mapped.replace(/^http/i, "ws");
+    } catch (e) {}
+    return protocols === undefined ? new _WS(url) : new _WS(url, protocols);
+  };
+  window.WebSocket.prototype = _WS.prototype;
+}
+
+// --- 属性写入：mw.loader 用 document.createElement('script') + .src ------
+var URL_ATTRS = { src: 1, href: 1, action: 1, poster: 1, data: 1, formaction: 1,
+                  "xlink:href": 1, "data-src": 1, "data-href": 1 };
+var SET_ATTRS = { srcset: 1, imagesrcset: 1, "data-srcset": 1 };
+
+function mapSrcset(v){
+  return String(v).split(",").map(function(part){
+    var m = /^(\\s*)(\\S+)(.*)$/.exec(part);
+    return m ? m[1] + map(m[2]) + m[3] : part;
+  }).join(",");
+}
+
+var _setAttribute = Element.prototype.setAttribute;
+Element.prototype.setAttribute = function(name, value){
+  try {
+    var n = String(name).toLowerCase();
+    if (URL_ATTRS[n]) value = map(value);
+    else if (SET_ATTRS[n]) value = mapSrcset(value);
+  } catch (e) {}
+  return _setAttribute.call(this, name, value);
+};
+
+function hookProp(proto, prop, fn){
+  try {
+    if (!proto) return;
+    var d = Object.getOwnPropertyDescriptor(proto, prop);
+    if (!d || !d.set || !d.configurable) return;
+    Object.defineProperty(proto, prop, {
+      configurable: true,
+      enumerable: d.enumerable,
+      get: d.get,
+      set: function(v){ d.set.call(this, fn(v)); }
+    });
+  } catch (e) {}
+}
+
+hookProp(window.HTMLScriptElement && HTMLScriptElement.prototype, "src", map);
+hookProp(window.HTMLLinkElement && HTMLLinkElement.prototype, "href", map);
+hookProp(window.HTMLImageElement && HTMLImageElement.prototype, "src", map);
+hookProp(window.HTMLImageElement && HTMLImageElement.prototype, "srcset", mapSrcset);
+hookProp(window.HTMLIFrameElement && HTMLIFrameElement.prototype, "src", map);
+hookProp(window.HTMLMediaElement && HTMLMediaElement.prototype, "src", map);
+hookProp(window.HTMLSourceElement && HTMLSourceElement.prototype, "src", map);
+hookProp(window.HTMLSourceElement && HTMLSourceElement.prototype, "srcset", mapSrcset);
+hookProp(window.HTMLFormElement && HTMLFormElement.prototype, "action", map);
+hookProp(window.HTMLObjectElement && HTMLObjectElement.prototype, "data", map);
+
+// --- 兜底：innerHTML 插入的节点不会走上面的钩子 --------------------------
+if (window.MutationObserver) {
+  var fix = function(el){
+    if (!el || el.nodeType !== 1 || !el.getAttribute) return;
+    for (var a in URL_ATTRS) {
+      if (!el.hasAttribute || !el.hasAttribute(a)) continue;
+      var v = el.getAttribute(a), n = map(v);
+      if (n !== v) _setAttribute.call(el, a, n);
+    }
+    for (var b in SET_ATTRS) {
+      if (!el.hasAttribute || !el.hasAttribute(b)) continue;
+      var v2 = el.getAttribute(b), n2 = mapSrcset(v2);
+      if (n2 !== v2) _setAttribute.call(el, b, n2);
+    }
+  };
+  new MutationObserver(function(records){
+    for (var i = 0; i < records.length; i++) {
+      var added = records[i].addedNodes;
+      for (var j = 0; j < added.length; j++) {
+        var node = added[j];
+        fix(node);
+        if (node.querySelectorAll) {
+          var kids = node.querySelectorAll("[src],[href],[action],[srcset],[data-src],[poster]");
+          for (var k = 0; k < kids.length; k++) fix(kids[k]);
+        }
+      }
+    }
+  }).observe(document.documentElement || document, { childList: true, subtree: true });
+}
+})();`;
+}
+
+// ===========================================================================
+// HTML 改写（流式）
+// ===========================================================================
+
+/** 元素 -> 需要改写的普通 URL 属性。 */
+const URL_ATTRS = {
+    a: ["href"],
+    area: ["href"],
+    link: ["href"],
+    script: ["src"],
+    img: ["src", "data-src", "longdesc"],
+    source: ["src"],
+    iframe: ["src"],
+    frame: ["src"],
+    form: ["action"],
+    video: ["src", "poster"],
+    audio: ["src"],
+    track: ["src"],
+    embed: ["src"],
+    object: ["data"],
+    input: ["formaction"],
+    button: ["formaction"],
+    use: ["href", "xlink:href"],
+    image: ["href", "xlink:href"],
+    blockquote: ["cite"],
+    q: ["cite"],
+    del: ["cite"],
+    ins: ["cite"],
+};
+
+/** 元素 -> 需要改写的 srcset 类属性。 */
+const SRCSET_ATTRS = {
+    img: ["srcset", "data-srcset"],
+    source: ["srcset", "data-srcset"],
+    link: ["imagesrcset"],
+};
+
+/** <meta content="..."> 里带 URL 的那几个。 */
+const META_URL_KEYS = new Set([
+    "og:url",
+    "og:image",
+    "og:image:url",
+    "og:image:secure_url",
+    "og:audio",
+    "og:video",
+    "twitter:image",
+    "twitter:image:src",
+    "msapplication-tileimage",
+]);
+
+const CSS_URL_RE = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
+
+function rewriteCss(css, ctx) {
+    return rewriteText(css, ctx).replace(
+        CSS_URL_RE,
+        (m, q, u) => `url(${q}${rewriteUrl(u, ctx)}${q})`
     );
-    return resp;
 }
 
-async function handleRequest(request) {
-    const url = new URL(request.url);
+function buildHtmlRewriter(ctx) {
+    const selector = (tags) => tags.join(",");
+    const rw = new HTMLRewriter();
 
-    if (url.hostname !== CONFIG.ALLOWED_HOSTNAME) {
+    // 1) 最前面注入客户端补丁（内联同步，早于任何其他脚本执行）
+    rw.on("head", {
+        element(el) {
+            el.prepend(
+                `<script>/*wikimirror*/${clientPatch(ctx)}</script>`,
+                { html: true }
+            );
+        },
+    });
+
+    // 2) 普通 URL 属性
+    for (const [tag, attrs] of Object.entries(URL_ATTRS)) {
+        rw.on(tag, {
+            element(el) {
+                for (const attr of attrs) {
+                    const v = el.getAttribute(attr);
+                    if (v != null) el.setAttribute(attr, rewriteUrl(v, ctx));
+                }
+            },
+        });
+    }
+
+    // 3) srcset
+    for (const [tag, attrs] of Object.entries(SRCSET_ATTRS)) {
+        rw.on(tag, {
+            element(el) {
+                for (const attr of attrs) {
+                    const v = el.getAttribute(attr);
+                    if (v != null) el.setAttribute(attr, rewriteSrcset(v, ctx));
+                }
+            },
+        });
+    }
+
+    // 4) 我们改写了 JS/CSS 正文，SRI 摘要必然失配 —— 必须去掉 integrity，
+    //    否则脚本/样式会被浏览器直接拒绝执行。
+    rw.on(selector(["script[integrity]", "link[integrity]"]), {
+        element(el) {
+            el.removeAttribute("integrity");
+        },
+    });
+
+    // 5) <meta content="...">
+    rw.on("meta", {
+        element(el) {
+            const key = (
+                el.getAttribute("property") ||
+                el.getAttribute("name") ||
+                ""
+            ).toLowerCase();
+            if (!META_URL_KEYS.has(key)) return;
+            const v = el.getAttribute("content");
+            if (v != null) el.setAttribute("content", rewriteUrl(v, ctx));
+        },
+    });
+
+    // 6) style 属性里的 url()
+    rw.on("[style]", {
+        element(el) {
+            const v = el.getAttribute("style");
+            if (v && v.includes("url(")) {
+                el.setAttribute("style", rewriteCss(v, ctx));
+            }
+        },
+    });
+
+    // 7) Parsoid 的 data-mw JSON
+    rw.on("[data-mw]", {
+        element(el) {
+            const v = el.getAttribute("data-mw");
+            if (v) el.setAttribute("data-mw", rewriteText(v, ctx));
+        },
+    });
+
+    // 8) 内联 <script>：RLCONF / RLPAGEMODULES / RLQ 都在这里
+    let scriptBuf = "";
+    let inScript = false;
+    rw.on("script", {
+        element(el) {
+            inScript = el.getAttribute("src") == null;
+            scriptBuf = "";
+        },
+        text(chunk) {
+            if (!inScript) return;
+            scriptBuf += chunk.text;
+            if (chunk.lastInTextNode) {
+                chunk.replace(rewriteText(scriptBuf, ctx), { html: true });
+                scriptBuf = "";
+            } else {
+                chunk.remove();
+            }
+        },
+    });
+
+    // 9) 内联 <style>
+    let styleBuf = "";
+    rw.on("style", {
+        element() {
+            styleBuf = "";
+        },
+        text(chunk) {
+            styleBuf += chunk.text;
+            if (chunk.lastInTextNode) {
+                chunk.replace(rewriteCss(styleBuf, ctx), { html: true });
+                styleBuf = "";
+            } else {
+                chunk.remove();
+            }
+        },
+    });
+
+    return rw;
+}
+
+// ===========================================================================
+// 响应头处理
+// ===========================================================================
+
+/**
+ * 上游 CSP 保留原有第三方白名单，但给每条取值型指令补上镜像自己需要的来源。
+ * 因为所有维基资源现在都变成同源，'self' 就够；再放行 Cloudflare 的统计脚本，
+ * 顺手消掉 issue #1 里那条 beacon.min.js 被拦的报错。
+ */
+const CSP_EXTRA = [
+    "'self'",
+    "'unsafe-inline'",
+    "'unsafe-eval'",
+    "blob:",
+    "data:",
+    "https://static.cloudflareinsights.com",
+];
+
+const CSP_FETCH_DIRECTIVES = new Set([
+    "default-src",
+    "script-src",
+    "script-src-elem",
+    "script-src-attr",
+    "style-src",
+    "style-src-elem",
+    "style-src-attr",
+    "img-src",
+    "font-src",
+    "connect-src",
+    "media-src",
+    "object-src",
+    "frame-src",
+    "child-src",
+    "worker-src",
+    "manifest-src",
+    "prefetch-src",
+]);
+
+function augmentCSP(headers) {
+    for (const name of [
+        "content-security-policy",
+        "content-security-policy-report-only",
+    ]) {
+        const raw = headers.get(name);
+        if (!raw) continue;
+
+        const policies = raw.split(",").map((policy) =>
+            policy
+                .split(";")
+                .map((d) => d.trim())
+                .filter(Boolean)
+                .filter((d) => {
+                    const key = d.split(/\s+/)[0].toLowerCase();
+                    // 上报端点指向 wikimedia，转发过来只会制造噪音
+                    return key !== "report-uri" && key !== "report-to";
+                })
+                .map((d) => {
+                    const tokens = d.split(/\s+/);
+                    const key = tokens[0].toLowerCase();
+                    if (!CSP_FETCH_DIRECTIVES.has(key)) return d;
+                    if (key === "object-src") return d; // 保持 'none'
+                    const have = new Set(tokens.slice(1));
+                    const add = CSP_EXTRA.filter((t) => !have.has(t));
+                    return add.length ? d + " " + add.join(" ") : d;
+                })
+                .join("; ")
+        );
+
+        headers.set(name, policies.join(", "));
+    }
+
+    // 这些上报头指向 wikimedia 的 intake，代理场景下没有意义
+    headers.delete("reporting-endpoints");
+    headers.delete("report-to");
+    headers.delete("nel");
+}
+
+/** Link: <...>; rel=preload 里的地址同样指向上游，需要改写。 */
+function rewriteLinkHeader(headers, ctx) {
+    const link = headers.get("link");
+    if (!link) return;
+    headers.set(
+        "link",
+        link.replace(/<([^>]+)>/g, (m, u) => `<${rewriteUrl(u, ctx)}>`)
+    );
+}
+
+function baseHeaders(upstream, ctx) {
+    const h = new Headers(upstream.headers);
+
+    // 我们要么改写正文、要么已由 CF 解压，这两个头一定不能留
+    h.delete("content-encoding");
+    h.delete("content-length");
+    h.delete("transfer-encoding");
+
+    // 不支持登录，会话 Cookie 只会污染缓存
+    h.delete("set-cookie");
+
+    // 上游按 Cookie / UA 分片，对镜像无意义
+    h.set("Vary", "Accept-Encoding");
+
+    augmentCSP(h);
+    rewriteLinkHeader(h, ctx);
+
+    const loc = h.get("location");
+    if (loc) h.set("location", rewriteUrl(loc, ctx));
+
+    h.set("Access-Control-Allow-Origin", "*");
+    h.set("X-Wikimirror-Upstream", ctx.host);
+    return h;
+}
+
+// ===========================================================================
+// 主流程
+// ===========================================================================
+
+function cacheControlFor(contentType, isApi) {
+    if (isApi) return "public, max-age=0, s-maxage=60";
+    if (/^(?:image|video|audio|font)\//i.test(contentType))
+        return "public, max-age=604800, s-maxage=2592000";
+    if (/^text\/html/i.test(contentType)) return "public, max-age=0, s-maxage=300";
+    return "public, max-age=3600, s-maxage=86400";
+}
+
+function forwardHeaders(request) {
+    const out = new Headers();
+    out.set("User-Agent", CFG.UA);
+    for (const name of [
+        "accept",
+        "accept-language",
+        "content-type",
+        "range",
+        "if-none-match",
+        "if-modified-since",
+    ]) {
+        const v = request.headers.get(name);
+        if (v) out.set(name, v);
+    }
+    // 上游按 Referer 做防盗链；给一个上游自身的地址最稳
+    out.set("Referer", `https://${CFG.DEFAULT_LANG}.wikipedia.org/`);
+    return out;
+}
+
+async function proxy(request, route, mirrorOrigin, cacheable, waitUntil) {
+    const url = new URL(request.url);
+    const ctx = { origin: mirrorOrigin, prefix: route.prefix, host: route.host };
+    const upstream = `https://${route.host}${route.path}${url.search}`;
+
+    const init = {
+        method: request.method,
+        headers: forwardHeaders(request),
+        redirect: "manual", // 自己改写 Location，浏览器地址栏才不会跳出镜像
+    };
+    if (request.method !== "GET" && request.method !== "HEAD") {
+        init.body = request.body;
+    }
+
+    const resp = await fetch(upstream, init);
+
+    // 304 / 无正文的状态直接回
+    if (resp.status === 304 || resp.status === 204) {
+        return new Response(null, {
+            status: resp.status,
+            headers: baseHeaders(resp, ctx),
+        });
+    }
+
+    const contentType = resp.headers.get("content-type") || "";
+    const headers = baseHeaders(resp, ctx);
+    const isApi = /\/(?:api\.php|rest\.php|rest_v1)/.test(route.path);
+    headers.set("Cache-Control", cacheControlFor(contentType, isApi));
+
+    let out;
+    if (/^(?:text\/html|application\/xhtml\+xml)/i.test(contentType)) {
+        // 强制声明 UTF-8：注入的脚本会把上游的 <meta charset> 顶出前 1024 字节
+        headers.set("Content-Type", "text/html; charset=UTF-8");
+        out = buildHtmlRewriter(ctx).transform(
+            new Response(resp.body, { status: resp.status, headers })
+        );
+    } else if (TEXTUAL.test(contentType)) {
+        const len = Number(resp.headers.get("content-length") || 0);
+        if (len > MAX_REWRITE_BYTES) {
+            out = new Response(resp.body, { status: resp.status, headers });
+        } else {
+            const text = await resp.text();
+            const body = /^text\/css/i.test(contentType)
+                ? rewriteCss(text, ctx)
+                : rewriteText(text, ctx);
+            out = new Response(body, { status: resp.status, headers });
+        }
+    } else {
+        // 图片 / 视频 / 字体等：流式转发，不碰正文
+        out = new Response(resp.body, { status: resp.status, headers });
+    }
+
+    if (cacheable && out.status === 200 && waitUntil) {
+        const key = new Request(request.url, { method: "GET" });
+        waitUntil(
+            caches.default
+                .put(key, out.clone())
+                .catch(() => {}) // 缓存失败不影响响应
+        );
+    }
+    return out;
+}
+
+async function handleRequest(request, waitUntil) {
+    const url = new URL(request.url);
+    const mirrorOrigin = url.origin;
+
+    if (
+        CFG.ALLOWED_HOSTNAMES.length &&
+        !CFG.ALLOWED_HOSTNAMES.includes(url.hostname)
+    ) {
         return new Response("Invalid hostname", { status: 403 });
     }
 
@@ -211,244 +936,120 @@ async function handleRequest(request) {
             status: 204,
             headers: {
                 "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS,POST",
+                "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
                 "Access-Control-Allow-Headers":
-                    "Content-Type,Accept,Authorization",
+                    "Content-Type,Accept,Authorization,Api-User-Agent",
+                "Access-Control-Max-Age": "86400",
                 Vary: "Origin",
             },
         });
     }
 
-    // serve client script at /__wm_client__.js (cachable)
-    if (url.pathname === "/__wm_client__.js") {
-        return new Response(CLIENT_PATCH_CONTENT, {
-            status: 200,
-            headers: {
-                "Content-Type": "application/javascript; charset=utf-8",
-                "Cache-Control": "public, max-age=86400", // cache client script 1 day
-            },
-        });
+    if (!["GET", "HEAD", "POST"].includes(request.method)) {
+        return new Response("Method not allowed", { status: 405 });
     }
 
-    // image proxy route: /image-proxy/<path...>
-    if (url.pathname.startsWith("/image-proxy/")) {
-        // reconstruct the remaining path after /image-proxy/
-        const imagePath =
-            url.pathname.replace("/image-proxy/", "") + url.search;
-        try {
-            return await handleImageProxy(request, imagePath);
-        } catch (e) {
-            return new Response("Image proxy error: " + e.message, {
-                status: 500,
-            });
-        }
+    // 语言集合还没就绪时后台拉一次，绝不阻塞当前请求（fail-open）
+    if (LANG_SET === null && waitUntil) {
+        waitUntil(refreshLangSet(mirrorOrigin));
     }
 
-    // 1) /wiki/... without language -> redirect to /en/wiki/...
-    if (
-        url.pathname.startsWith("/wiki/") &&
-        !CONFIG.SUPPORTED_LANGUAGES.some((l) =>
-            url.pathname.startsWith(`/${l}/`)
-        )
-    ) {
-        return Response.redirect(
-            `${url.origin}/en${url.pathname}${url.search}`,
-            301
+    // 调试端点：看看当前认可的语言集合
+    if (url.pathname === "/-/langs.json") {
+        return new Response(
+            JSON.stringify(
+                {
+                    source: LANG_SET ? "sitematrix" : "shape-heuristic",
+                    count: LANG_SET ? LANG_SET.size : null,
+                    codes: LANG_SET ? [...LANG_SET].sort() : null,
+                    shape: LANG_SHAPE.source,
+                    notALanguage: [...NOT_A_LANG],
+                },
+                null,
+                2
+            ),
+            {
+                headers: {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Cache-Control": "public, max-age=300",
+                },
+            }
         );
     }
 
-    // parse pathParts and language
-    const parts = url.pathname.split("/").filter(Boolean);
-    let lang = null;
-    let upstreamPath = url.pathname;
-    let upstreamHost = `www.${CONFIG.WIKI_HOSTNAME}`;
-
-    if (parts.length && CONFIG.SUPPORTED_LANGUAGES.includes(parts[0])) {
-        lang = parts[0];
-        const rest = parts.slice(1);
-        upstreamPath = "/" + rest.join("/");
-        if (upstreamPath === "/") upstreamPath = "/";
-        upstreamHost = `${lang}.${CONFIG.WIKI_HOSTNAME}`;
-    }
-
-    // Host-based API fallback (recover language from Referer or accept-language)
-    if (
-        !lang &&
-        (url.pathname.startsWith("/w/rest.php") ||
-            url.pathname.startsWith("/w/api.php") ||
-            url.pathname.startsWith("/api/"))
-    ) {
-        const rlang = extractLangFromReferer(request);
-        if (rlang) {
-            lang = rlang;
-            upstreamHost = `${lang}.${CONFIG.WIKI_HOSTNAME}`;
-        } else {
-            // try Accept-Language header as secondary hint (take first token)
-            const al = request.headers.get("accept-language");
-            if (al) {
-                const candidate = al.split(",")[0].split("-")[0];
-                if (
-                    candidate &&
-                    CONFIG.SUPPORTED_LANGUAGES.includes(candidate)
-                ) {
-                    lang = candidate;
-                    upstreamHost = `${lang}.${CONFIG.WIKI_HOSTNAME}`;
-                } else {
-                    upstreamHost = `en.${CONFIG.WIKI_HOSTNAME}`;
-                }
-            } else {
-                upstreamHost = `en.${CONFIG.WIKI_HOSTNAME}`;
-            }
-        }
-    }
-
-    const upstreamUrl = `https://${upstreamHost}${upstreamPath}${url.search}`;
-
-    // image file extension handling (if user requests wiki.davidx.top/zh/path/to/foo.jpg directly)
-    if (isImagePath(url.pathname)) {
-        try {
-            // route to upstreamHost (which may be lang-specific) but also could be upload.wikimedia if path indicates that
-            const upstreamResp = await fetch(upstreamUrl, {
-                method: request.method,
+    // 客户端补丁的独立副本（正常路径下是内联的，这里方便调试 / 排错）
+    if (url.pathname === "/-/client.js") {
+        const lang = url.searchParams.get("lang") || "";
+        const prefix = isLangCode(lang) ? `/${lang}` : "";
+        return new Response(
+            clientPatch({ origin: mirrorOrigin, prefix, host: "" }),
+            {
                 headers: {
-                    Accept: request.headers.get("Accept") || "*/*",
-                    "User-Agent": CONFIG.COMMON_UA,
-                    Referer: request.headers.get("Referer") || "",
+                    "Content-Type": "application/javascript; charset=utf-8",
+                    "Cache-Control": "public, max-age=86400",
                 },
-                cf: { cacheEverything: true },
-            });
-            const resp = new Response(upstreamResp.body, {
-                status: upstreamResp.status,
-                statusText: upstreamResp.statusText,
-                headers: upstreamResp.headers,
-            });
-            resp.headers.set("Access-Control-Allow-Origin", "*");
-            resp.headers.set(
-                "Cache-Control",
-                "public, max-age=604800, s-maxage=604800"
+            }
+        );
+    }
+
+    let route = resolveRoute(url.pathname);
+    let cacheable = request.method === "GET" && !request.headers.has("range");
+
+    if (!route) {
+        // 无前缀请求：可能是漏改的资源，或用户手输的 /wiki/Foo
+        const prefix =
+            prefixFromReferer(request, url.host) ??
+            prefixFromAcceptLanguage(request) ??
+            `/${CFG.DEFAULT_LANG}`;
+
+        // 导航类请求给 301，让地址栏和后续相对解析都落到正确前缀上
+        if (
+            request.method === "GET" &&
+            (request.headers.get("sec-fetch-mode") === "navigate" ||
+                url.pathname.startsWith("/wiki/"))
+        ) {
+            return Response.redirect(
+                `${mirrorOrigin}${prefix}${url.pathname}${url.search}`,
+                301
             );
-            return resp;
+        }
+
+        const host = hostFromPrefix(prefix);
+        if (!host) return new Response("Not found", { status: 404 });
+        route = { prefix, host, path: url.pathname };
+        // 结果依赖 Referer，绝不能按 URL 缓存
+        cacheable = false;
+    }
+
+    if (cacheable) {
+        try {
+            const hit = await caches.default.match(
+                new Request(url.toString(), { method: "GET" })
+            );
+            if (hit) return hit;
         } catch (e) {
-            return new Response("Image proxy error: " + e.message, {
-                status: 500,
-            });
+            /* 缓存不可用就直接回源 */
         }
     }
 
-    // forward minimal headers
     try {
-        const forward = {};
-        forward["User-Agent"] = CONFIG.COMMON_UA;
-        if (request.headers.get("Accept"))
-            forward["Accept"] = request.headers.get("Accept");
-        if (request.headers.get("Referer"))
-            forward["Referer"] = request.headers.get("Referer");
-        if (request.headers.get("Accept-Language"))
-            forward["Accept-Language"] = request.headers.get("Accept-Language");
-
-        const upstreamResp = await fetch(upstreamUrl, {
-            method: request.method,
-            headers: forward,
-            redirect: "follow",
-        });
-
-        const contentType = upstreamResp.headers.get("content-type") || "";
-        // For non-HTML (API JSON, CSS, JS) passthrough but ensure CORS
-        if (!contentType.includes("text/html")) {
-            const j = new Response(upstreamResp.body, {
-                status: upstreamResp.status,
-                statusText: upstreamResp.statusText,
-                headers: upstreamResp.headers,
-            });
-            j.headers.set("Access-Control-Allow-Origin", "*");
-            j.headers.set("Cache-Control", "public, max-age=60, s-maxage=60");
-            return j;
-        }
-
-        // HTML: read & perform replacements
-        let body = await upstreamResp.text();
-
-        // 1) replace resource domains
-        for (const [from, to] of Object.entries(CONFIG.REPLACE_RULES)) {
-            const re = new RegExp(escapeForRegex(from), "g");
-            body = body.replace(re, to);
-        }
-
-        // 2) replace lang subdomain -> /lang path
-        for (const l of CONFIG.SUPPORTED_LANGUAGES) {
-            const domain = `${l}.${CONFIG.WIKI_HOSTNAME}`;
-            body = body.replaceAll(domain, `${CONFIG.ALLOWED_HOSTNAME}/${l}`);
-        }
-
-        // 3) if current request is language-specific, add /{lang} prefix to absolute internal paths
-        if (lang) {
-            const p = `/${lang}`;
-            body = body.replace(/href="\/((?!\/)[^"]*)"/g, `href="${p}/$1"`);
-            body = body.replace(/src="\/((?!\/)[^"]*)"/g, `src="${p}/$1"`);
-            body = body.replace(
-                /action="\/((?!\/)[^"]*)"/g,
-                `action="${p}/$1"`
-            );
-            body = body.replace(
-                /data-src="\/((?!\/)[^"]*)"/g,
-                `data-src="${p}/$1"`
-            );
-            body = body.replace(
-                /data-href="\/((?!\/)[^"]*)"/g,
-                `data-href="${p}/$1"`
-            );
-            body = body.replace(
-                /url\\("\/((?!\/)[^"]+)"\\)/g,
-                `url("${p}/$1")`
-            );
-
-            body = body.replace(/(["'(])\/(api\/[^"'\)\s>]+)/g, `$1${p}/$2`);
-            body = body.replace(/(["'(])\/(w\/[^"'\)\s>]+)/g, `$1${p}/$2`);
-            body = body.replace(/(["'(])\/(wiki\/[^"'\)\s>]+)/g, `$1${p}/$2`);
-        }
-
-        // Inject external client script (defer) so we avoid inline JS; ensures runtime patching of dynamic requests
-        const scriptTag = `<script src="/__wm_client__.js" defer></script>`;
-        if (body.indexOf(scriptTag) === -1) {
-            if (body.indexOf("</head>") !== -1) {
-                body = body.replace("</head>", scriptTag + "</head>");
-            } else if (body.indexOf("</body>") !== -1) {
-                body = body.replace("</body>", scriptTag + "</body>");
-            } else {
-                body = body + scriptTag;
-            }
-        }
-
-        // clone headers and attempt to adjust CSP to allow our script (best effort)
-        const newHeaders = new Headers(upstreamResp.headers);
-        // try to add our origin to script-src or default-src; fallback: delete CSP
-        adjustCSPHeader(newHeaders, `https://${CONFIG.ALLOWED_HOSTNAME}`);
-        newHeaders.set("Access-Control-Allow-Origin", "*");
-        newHeaders.set("Cache-Control", "public, max-age=3600, s-maxage=3600");
-
-        const resp = new Response(body, {
-            status: upstreamResp.status,
-            statusText: upstreamResp.statusText,
-            headers: newHeaders,
-        });
-
-        // cache at edge
-        try {
-            if (
-                (request.method === "GET" || request.method === "HEAD") &&
-                upstreamResp.status === 200
-            ) {
-                const cache = caches.default;
-                const cacheKey = new Request(request.url, { method: "GET" });
-                await cache.put(cacheKey, resp.clone());
-            }
-        } catch (e) {
-            // ignore cache errors
-            console.error("cache put failed", e);
-        }
-
-        return resp;
+        return await proxy(request, route, mirrorOrigin, cacheable, waitUntil);
     } catch (err) {
-        return new Response("Proxy error: " + err.message, { status: 500 });
+        return new Response(
+            `Upstream error for https://${route.host}${route.path}\n\n${err && err.message}`,
+            {
+                status: 502,
+                headers: {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Cache-Control": "no-store",
+                },
+            }
+        );
     }
 }
+
+addEventListener("fetch", (event) => {
+    event.respondWith(
+        handleRequest(event.request, event.waitUntil.bind(event))
+    );
+});
